@@ -98,6 +98,7 @@ from inspect_ai.model._providers._google_citations import (
     distribute_citations_to_text_parts,
     get_candidate_citations,
 )
+from inspect_ai.model._providers._google_vertex_batch import GoogleVertexBatcher
 from inspect_ai.model._retry import model_retry_config
 from inspect_ai.tool import (
     ToolCall,
@@ -247,11 +248,19 @@ class GoogleGenAIAPI(ModelAPI):
             # custom base_url
             self.base_url = model_base_url(self.base_url, "GOOGLE_BASE_URL")
 
-        # save model args
+        # Extract GCS bucket for Vertex AI batch processing (not a valid Client param)
+        # Check environment variables first, then model_args
+        self._gcs_bucket = (
+            os.environ.get("GOOGLE_VERTEX_BATCH_BUCKET")
+            or os.environ.get("VERTEX_BATCH_BUCKET")
+            or model_args.pop("gcs_bucket", None)
+        )
+
+        # save model args (now without batcher-specific args)
         self.model_args = model_args
 
         # initialize batcher
-        self._batcher: GoogleBatcher | None = None
+        self._batcher: GoogleBatcher | GoogleVertexBatcher | None = None
 
     def is_vertex(self) -> bool:
         return self.service == "vertex"
@@ -669,12 +678,6 @@ class GoogleGenAIAPI(ModelAPI):
         if self._batcher or not (batch_config := normalized_batch_config(config.batch)):
             return
 
-        # verify we aren't trying to use the batcher with vertex
-        if self.is_vertex():
-            raise NotImplementedError(
-                "Cannot use batch inference with Vertex AI (GCS-based batch jobs not supported)"
-            )
-
         # create a dedicated client instance for the batcher
         client = Client(
             vertexai=self.is_vertex(),
@@ -683,19 +686,33 @@ class GoogleGenAIAPI(ModelAPI):
             **self.model_args,
         )
 
-        self._batcher = GoogleBatcher(
-            client,
-            batch_config,
-            model_retry_config(
-                self.model_name,
-                config.max_retries,
-                config.timeout,
-                self.should_retry,
-                lambda ex: None,
-                log_model_retry,
-            ),
-            self.service_model_name(),
+        retry_config = model_retry_config(
+            self.model_name,
+            config.max_retries,
+            config.timeout,
+            self.should_retry,
+            lambda ex: None,
+            log_model_retry,
         )
+
+        # Use GCS-based batcher for Vertex AI
+        if self.is_vertex():
+            self._batcher = GoogleVertexBatcher(
+                client,
+                batch_config,
+                retry_config,
+                self.service_model_name(),
+                project=self.model_args.get("project"),
+                location=self.model_args.get("location"),
+                gcs_bucket=self._gcs_bucket,
+            )
+        else:
+            self._batcher = GoogleBatcher(
+                client,
+                batch_config,
+                retry_config,
+                self.service_model_name(),
+            )
 
 
 def safety_settings_to_list(
@@ -924,6 +941,30 @@ async def chat_content_to_part(
     content: ContentImage | ContentAudio | ContentVideo | ContentDocument,
 ) -> Part:
     if isinstance(content, ContentImage):
+        # If the content has an internal representation, try to use it
+        # This is useful for batch processing to avoid embedding full image bytes
+        if content.internal is not None:
+            try:
+                # If internal is already a Part dict representation, use it
+                if isinstance(content.internal, dict):
+                    # Validate it has expected Part structure
+                    if any(
+                        k in content.internal
+                        for k in [
+                            "inline_data",
+                            "file_data",
+                            "text",
+                            "function_call",
+                            "function_response",
+                        ]
+                    ):
+                        return Part.model_validate(content.internal)
+            except Exception:
+                # If internal representation can't be used, fall back to normal conversion
+                pass
+
+        # Normal conversion: load image bytes
+
         content_bytes, mime_type = await file_as_data(content.image)
         return Part.from_bytes(mime_type=mime_type, data=content_bytes)
     else:
