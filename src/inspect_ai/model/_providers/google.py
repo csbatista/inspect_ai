@@ -302,8 +302,9 @@ class GoogleGenAIAPI(ModelAPI):
                 if not has_native_tools and len(tools) > 0
                 else None
             )
+            is_vertex_batch = self.is_vertex() and self._batcher is not None
             system_instruction = await extract_system_message_as_parts(
-                client, input, tools
+                client, input, tools, is_vertex_batch
             )
             parameters = GenerateContentConfig(
                 http_options=HttpOptions(
@@ -975,7 +976,7 @@ async def chat_content_to_part(
 
 
 async def extract_system_message_as_parts(
-    client: Client, messages: list[ChatMessage], tools: list[ToolInfo]
+    client: Client, messages: list[ChatMessage], tools: list[ToolInfo], is_vertex_batch: bool = False
 ) -> list[File | Part | Image | str] | None:
     system_parts: list[File | Part | Image | str] = []
     for message in messages:
@@ -1003,26 +1004,29 @@ async def extract_system_message_as_parts(
             )
         )
 
-    # if every part is text then return list[str] rather than list[Part]
-    # works around issue w/ open-telemetry not expecting parts
-    if system_parts:
-        text_parts: list[File | Part | Image | str] = []
-        for p in system_parts:
-            if isinstance(p, str):
-                text_parts.append(p)
-            elif isinstance(p, Part) and p.text is not None:
-                text_parts.append(p.text)
-            else:
-                break
-
-        if len(text_parts) == len(system_parts):
-            return text_parts
-        else:
-            return system_parts
-
+    if is_vertex_batch:
+        return system_parts or None
     else:
-        # google-genai raises "ValueError: content is required." if the list is empty.
-        return None
+        # if every part is text then return list[str] rather than list[Part]
+        # works around issue w/ open-telemetry not expecting parts
+        if system_parts:
+            text_parts: list[File | Part | Image | str] = []
+            for p in system_parts:
+                if isinstance(p, str):
+                    text_parts.append(p)
+                elif isinstance(p, Part) and p.text is not None:
+                    text_parts.append(p.text)
+                else:
+                    break
+
+            if len(text_parts) == len(system_parts):
+                return text_parts
+            else:
+                return system_parts
+
+        else:
+            # google-genai raises "ValueError: content is required." if the list is empty.
+            return None
 
 
 # https://ai.google.dev/gemini-api/tutorials/extract_structured_data#define_the_schema
